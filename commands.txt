@@ -1,0 +1,108 @@
+ssh gpucluster2.doc.ic.ac.uk              # skip if you're already on gpucluster2/3
+salloc --partition a30 --gres=gpu:1 --time=08:00:00
+source /vol/gpudata/tq422-vla/vla_env.sh  # sets all paths and activates the venv
+cd $WS
+cd lerobot
+export MODEL=$WS/models/pi05_libero_finetuned_v044
+export OUT=$WS/lerobot/outputs
+
+nvidia-smi        # shows your allocated GPU
+which python      # should be /vol/gpudata/tq422-vla/venv/bin/python
+
+squeue --me
+ssh tq422@gpuvm36.doc.ic.ac.uk
+
+
+export MODEL=$WS/models/pi05_libero_finetuned_v044
+export OUT=$WS/lerobot/outputs
+
+
+lerobot-eval \
+  --policy.path=$MODEL \
+  --policy.device=cuda \
+  --env.type=libero \
+  --env.task=libero_object \
+  --eval.batch_size=1 \
+  --eval.n_episodes=10 \
+  --output_dir=$OUT/eval/object_baseline
+
+tasks:
+a16 less than 4 hour job
+probe pi_0.5
+python probe_pi05.py --episode 0 --offset 0
+python probe_pi05.py --episode 0 --offset 60
+
+# ---- Blind-spot coverage + state-swap probes (libero_object, per-task) ----
+# Run after salloc + source vla_env.sh. Re-run map_state_coverage.py after
+# recordings exist so eval density is not empty.
+#
+# Prefer run_eval_recording.py over raw lerobot-eval: stock _build_raw_frame
+# misses nested LIBERO robot_state/eef/pos. The wrapper patches that, then
+# calls the same eval CLI.
+
+# 0. Prerequisite eval recording (GPU, once). Keeps object_baseline untouched.
+python run_eval_recording.py \
+  --policy.path=$MODEL \
+  --policy.device=cuda \
+  --env.type=libero \
+  --env.task=libero_object \
+  --eval.batch_size=1 \
+  --eval.n_episodes=10 \
+  --eval.recording=true \
+  --output_dir=$OUT/eval/object_recorded
+
+# equivalent stock command (EEF may be missing from recordings):
+# lerobot-eval \
+#   --policy.path=$MODEL \
+#   --policy.device=cuda \
+#   --env.type=libero \
+#   --env.task=libero_object \
+#   --eval.batch_size=1 \
+#   --eval.n_episodes=10 \
+#   --eval.recording=true \
+#   --output_dir=$OUT/eval/object_recorded
+
+# Compute-heavy coverage / model / sim steps: ssh tq422@clapper, then
+# source /vol/gpudata/tq422-vla/vla_env.sh && cd $WS/lerobot
+
+# 1. Map coverage + furthest blind point + p1–p5 trail (CPU on clapper).
+python map_state_coverage.py \
+  --eval-dir $OUT/eval/object_recorded/recordings \
+  --output-dir $OUT/blindspot/coverage \
+  --task-ids 1
+
+# Full 10-task sweep (one furthest blind point + p1–p5 trail per task):
+python map_state_coverage.py \
+  --eval-dir $OUT/eval/object_recorded/recordings \
+  --output-dir $OUT/blindspot/coverage
+
+# 2. Sim-positioned object probes (GPU on clapper). Primary test.
+# One furthest point per task; trail p1 (boundary) → p5 (furthest).
+# Eval videos: baseline_rollout.mp4 + p1_rollout … p5_rollout (6 per task).
+python probe_blindspots_sim.py \
+  --coverage-dir $OUT/blindspot/coverage \
+  --model-path $MODEL \
+  --output-dir $OUT/blindspot/probes_sim \
+  --task-ids 22 \
+  --run-eval-rollout \
+  --skip-init-rollout
+
+# Full open-loop sweep (no videos):
+python probe_blindspots_sim.py \
+  --coverage-dir $OUT/blindspot/coverage \
+  --model-path $MODEL \
+  --output-dir $OUT/blindspot/probes_sim
+
+# 3. Counterfactual expert replay (CPU/GPU sim, no VLA). Nearest lerobot/libero
+# demo + open-loop action replay at sim probe poses; alignment PNG + mp4.
+python counterfactual_expert_replay.py \
+  --probe-results $OUT/blindspot/probes_sim/task_22/probe_results.json \
+  --output-dir $OUT/blindspot/counterfactual_expert \
+  --roles p1_boundary p5_far
+
+# 2b. Legacy state-swap probes (frozen vision):
+# python probe_blindspots.py \
+#   --coverage-dir $OUT/blindspot/coverage \
+#   --model-path $MODEL \
+#   --output-dir $OUT/blindspot/probes
+

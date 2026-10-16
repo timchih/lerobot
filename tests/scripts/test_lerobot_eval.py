@@ -24,8 +24,20 @@ from lerobot.lerobot_types import TransitionKey
 from lerobot.policies.flux3 import make_flux3_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline, ProcessorStep
 from lerobot.processor.factory import make_policy_processor_pipelines
-from lerobot.scripts.lerobot_eval import rollout
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.scripts.lerobot_eval import (
+    _build_raw_frame,
+    _env_features_to_dataset_features,
+    _open_recording_dataset,
+    rollout,
+)
+from lerobot.utils.constants import (
+    ACTION,
+    LIBERO_KEY_EEF_POS,
+    LIBERO_KEY_PIXELS_AGENTVIEW,
+    OBS_IMAGES,
+    OBS_STATE,
+)
 from tests.policies.flux3.helpers import task_config
 
 
@@ -144,3 +156,83 @@ def test_rollout_starts_each_episode_with_fresh_processor_state(pipeline_kind):
     if pipeline_kind == "flux3":
         # Delta 0.25 unnormalizes to 0.5 and must be added to B's initial measured position.
         torch.testing.assert_close(reused_actions[0, 0, :-1], torch.full((5,), 2.5), rtol=0, atol=0)
+
+
+def test_open_recording_dataset_replaces_incomplete_directory(tmp_path):
+    root = tmp_path / "recording"
+    root.mkdir()
+    features = {
+        "action": {"dtype": "float32", "shape": (7,), "names": None},
+        "observation.state.eef_pos": {"dtype": "float32", "shape": (3,), "names": None},
+    }
+
+    dataset = _open_recording_dataset(
+        repo_id="eval_recording",
+        root=str(root),
+        fps=20,
+        features=features,
+    )
+
+    assert (root / "meta" / "info.json").is_file()
+    dataset.finalize()
+
+    resumed = _open_recording_dataset(
+        repo_id="eval_recording",
+        root=str(root),
+        fps=20,
+        features=features,
+    )
+    assert resumed.meta.total_episodes == 0
+
+
+def test_env_features_to_dataset_features_uses_features_map():
+    env_features = {
+        LIBERO_KEY_PIXELS_AGENTVIEW: PolicyFeature(type=FeatureType.VISUAL, shape=(360, 360, 3)),
+        LIBERO_KEY_EEF_POS: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+        ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+    }
+    features_map = {
+        LIBERO_KEY_PIXELS_AGENTVIEW: f"{OBS_IMAGES}.image",
+        LIBERO_KEY_EEF_POS: f"{OBS_STATE}.eef_pos",
+        ACTION: ACTION,
+    }
+
+    dataset_features = _env_features_to_dataset_features(env_features, features_map)
+
+    assert f"{OBS_IMAGES}.image" in dataset_features
+    assert f"{OBS_STATE}.eef_pos" in dataset_features
+    assert "/" not in "".join(dataset_features)
+
+
+def test_build_raw_frame_reads_nested_libero_observation():
+    env_features = {
+        LIBERO_KEY_PIXELS_AGENTVIEW: PolicyFeature(type=FeatureType.VISUAL, shape=(2, 2, 3)),
+        LIBERO_KEY_EEF_POS: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+        ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+    }
+    features_map = {
+        LIBERO_KEY_PIXELS_AGENTVIEW: f"{OBS_IMAGES}.image",
+        LIBERO_KEY_EEF_POS: f"{OBS_STATE}.eef_pos",
+        ACTION: ACTION,
+    }
+    dataset_features = _env_features_to_dataset_features(env_features, features_map)
+    raw_obs = {
+        "pixels": {"image": np.zeros((1, 2, 2, 3), dtype=np.uint8)},
+        "robot_state": {"eef": {"pos": np.array([[1.0, 2.0, 3.0]], dtype=np.float64)}},
+    }
+
+    frame = _build_raw_frame(
+        raw_obs,
+        env_idx=0,
+        action=np.zeros(7, dtype=np.float32),
+        reward=0.0,
+        success=False,
+        done=False,
+        task="pick up the mug",
+        dataset_features=dataset_features,
+        env_features_map=features_map,
+    )
+
+    assert frame[f"{OBS_IMAGES}.image"].shape == (2, 2, 3)
+    np.testing.assert_allclose(frame[f"{OBS_STATE}.eef_pos"], [1.0, 2.0, 3.0])
+    assert frame[f"{OBS_STATE}.eef_pos"].dtype == np.float32
